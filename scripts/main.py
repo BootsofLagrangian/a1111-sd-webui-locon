@@ -61,8 +61,6 @@ re_text_block = re.compile(r"lora_te_text_model_encoder_layers_(\d+)_(.+)")
 
 
 def convert_diffusers_name_to_compvis(key, is_sd2):
-    # I don't know why but some state dict has this kind of thing
-    key = key.replace('text_model_text_model', 'text_model')
     def match(match_list, regex):
         r = re.match(regex, key)
         if not r:
@@ -211,7 +209,6 @@ class LoraUpDownModule:
             ).reshape(self.shape)
             return self.op(
                 x, rebuild_weight,
-                bias=None,
                 **self.extra_args
             )
         else:
@@ -224,6 +221,12 @@ class LoraUpDownModule:
 def pro3(t, wa, wb):
     temp = torch.einsum('i j k l, j r -> i r k l', t, wb)
     return torch.einsum('i j k l, i r -> r j k l', temp, wa)
+
+
+def pro3_outer(t, wa, b): # for outer product
+    raise NotImplemented()
+    # temp = torch.einsum('i j k l, j r -> i r k l', t, wb)
+    # return torch.einsum('i j k l, i r -> r j k l', temp, wa)
 
 
 class LoraHadaModule:
@@ -255,7 +258,6 @@ class LoraHadaModule:
             return self.op(
                 x,
                 ((self.w1a @ self.w1b) * (self.w2a @ self.w2b) + bias).view(self.shape),
-                bias=None,
                 **self.extra_args
             )
         else:
@@ -263,16 +265,49 @@ class LoraHadaModule:
                 x,
                 (pro3(self.t1, self.w1a, self.w1b) 
                  * pro3(self.t2, self.w2a, self.w2b) + bias).view(self.shape),
-                bias=None,
                 **self.extra_args
             )
 
-
-class IA3Module:
+class LoraKronModule:
     def __init__(self):
-        self.w = None
+        self.t1 = None
+        self.w1a = None
+        self.w1b = None
+        self.t2 = None
+        self.w2a = None
+        self.w2b = None
         self.alpha = None
-        self.on_input = None
+        self.dim = None
+        self.op = None
+        self.extra_args = {}
+        self.shape = None
+        self.bias = None
+        self.up = None
+    
+    def down(self, x):
+        return x
+    
+    def inference(self, x):
+        if hasattr(self, 'bias') and isinstance(self.bias, torch.Tensor):
+            bias = self.bias
+        else:
+            bias = 0
+        
+        if self.t1 is None:
+            return self.op(
+                x,
+                (torch.kron(self.w1a@self.w1b, self.w2a@self.w2b) + bias).view(self.shape),
+                **self.extra_args
+            )
+        else:
+            # will raise NotImplemented Error
+            return self.op(
+                x,
+                (pro3_outer(self.t1, self.w1a, self.w1b) 
+                 * pro3_outer(self.t2, self.w2a, self.w2b) + bias).view(self.shape),
+                **self.extra_args
+            )
+
 
 
 CON_KEY = {
@@ -288,13 +323,16 @@ HADA_KEY = {
     "hada_w2_a",
     "hada_w2_b",
 }
-IA3_KEY = {
-    "weight",
-    "on_input"
+KRON_KEY = {
+    "lokr_t1",
+    "lokr_w1_a",
+    "lokr_w1_b",
+    "lokr_t2",
+    "lokr_w2_a",
+    "lokr_w2_b",
 }
 
 def load_lora(name, filename):
-    print('locon load lora method')
     lora = LoraModule(name)
     lora.mtime = os.path.getmtime(filename)
 
@@ -404,8 +442,6 @@ def load_lora(name, filename):
             if hasattr(sd_module, 'weight'):
                 lora_module.shape = sd_module.weight.shape
             with torch.no_grad():
-                if weight.shape != module.weight.shape:
-                    weight = weight.reshape(module.weight.shape)
                 module.weight.copy_(weight)
 
             module.to(device=devices.cpu if new_lora else devices.device, dtype=devices.dtype)
@@ -473,15 +509,56 @@ def load_lora(name, filename):
                 }
             else:
                 assert False, f'Lora layer {key_diffusers} matched a layer with unsupported type: {type(sd_module).__name__}'
-        elif lora_key in IA3_KEY:
-            if type(lora_module) != IA3Module:
-                lora_module = IA3Module()
+                
+        elif lora_key in KRON_KEY:
+            if not isinstance(lora_module, LoraKronModule):
+                alpha = lora_module.alpha
+                bias = lora_module.bias
+                lora_module = LoraKronModule()
+                lora_module.alpha = alpha
+                lora_module.bias = bias
                 lora.modules[key] = lora_module
+            if hasattr(sd_module, 'weight'):
+                lora_module.shape = sd_module.weight.shape
             
-            if lora_key == "weight":
-                lora_module.w = weight.to(devices.device, dtype=devices.dtype)
-            elif lora_key == "on_input":
-                lora_module.on_input = weight
+            weight = weight.to(device=devices.cpu if new_lora else devices.device, dtype=devices.dtype)
+            weight.requires_grad_(False)
+            
+            if lora_key == 'lokr_w1_a':
+                lora_module.w1a = weight
+                if lora_module.up is None:
+                    lora_module.up = FakeModule(
+                        lora_module.w1a,
+                        lora_module.inference
+                    )
+            elif lora_key == 'lokr_w1_b':
+                lora_module.w1b = weight
+                lora_module.dim = weight.shape[0]
+            elif lora_key == 'lokr_w2_a':
+                lora_module.w2a = weight
+            elif lora_key == 'lokr_w2_b':
+                lora_module.w2b = weight
+            elif lora_key == 'lokr_t1':
+                lora_module.t1 = weight
+                lora_module.up = FakeModule(
+                    lora_module.t1,
+                    lora_module.inference
+                )
+            elif lora_key == 'lokr_t2':
+                lora_module.t2 = weight
+            
+            if (any(isinstance(sd_module, torch_layer) for torch_layer in 
+                    [torch.nn.Linear, torch.nn.modules.linear.NonDynamicallyQuantizableLinear, torch.nn.MultiheadAttention])):
+                lora_module.op = torch.nn.functional.linear
+            elif isinstance(sd_module, torch.nn.Conv2d):
+                lora_module.op = torch.nn.functional.conv2d
+                lora_module.extra_args = {
+                    'stride': sd_module.stride,
+                    'padding': sd_module.padding
+                }
+            else:
+                assert False, f'Lora layer {key_diffusers} matched a layer with unsupported type: {type(sd_module).__name__}'
+        
         else:
             assert False, f'Bad Lora layer name: {key_diffusers} - must end in lora_up.weight, lora_down.weight or alpha'
 
@@ -532,7 +609,7 @@ def _rebuild_cp_decomposition(up, down, mid):
 
 
 def rebuild_weight(module, orig_weight: torch.Tensor) -> torch.Tensor:
-    if module.__class__.__name__ == 'LoraUpDownModule':
+    if isinstance(module, LoraUpDownModule):
         up = module.up_model.weight.to(orig_weight.device, dtype=orig_weight.dtype)
         down = module.down_model.weight.to(orig_weight.device, dtype=orig_weight.dtype)
         
@@ -547,7 +624,7 @@ def rebuild_weight(module, orig_weight: torch.Tensor) -> torch.Tensor:
                 output_shape += down.shape[2:]
             updown = _rebuild_conventional(up, down, output_shape)
         
-    elif module.__class__.__name__ == 'LoraHadaModule':
+    elif isinstance(module, LoraHadaModule):
         w1a = module.w1a.to(orig_weight.device, dtype=orig_weight.dtype)
         w1b = module.w1b.to(orig_weight.device, dtype=orig_weight.dtype)
         w2a = module.w2a.to(orig_weight.device, dtype=orig_weight.dtype)
@@ -570,28 +647,38 @@ def rebuild_weight(module, orig_weight: torch.Tensor) -> torch.Tensor:
             updown2 = pro3(t2, w2a, w2b)
         else:
             updown2 = _rebuild_conventional(w2a, w2b, output_shape)
-        
         updown = updown1 * updown2
     
-    elif module.__class__.__name__ == 'FullModule':
+    elif isinstance(module, LoraKronModule):
+        w1a = module.w1a.to(orig_weight.device, dtype=orig_weight.dtype)
+        w1b = module.w1b.to(orig_weight.device, dtype=orig_weight.dtype)
+        w2a = module.w2a.to(orig_weight.device, dtype=orig_weight.dtype)
+        w2b = module.w2b.to(orig_weight.device, dtype=orig_weight.dtype)
+        
+        output_shape = [w1a.size(0), w1b.size(1)]
+        output_shape_1 = output_shape
+        output_shape_2 = [w2a.size(0), w2b.size(1)]
+        
+        if module.t1 is not None:
+            output_shape = [w1a.size(1), w1b.size(1)] # [rank, rank]
+            t1 = module.t1.to(orig_weight.device, dtype=orig_weight.dtype)
+            updown1 = pro3(t1, w1a, w1b)
+            output_shape += t1.shape[2:] # [rank, rank, *kernel]
+        else:
+            if len(w1b.shape) == 4:
+                output_shape_1 += w1b.shape[2:]
+            updown1 = _rebuild_conventional(w1a, w1b, output_shape_1)
+        
+        if module.t2 is not None:
+            t2 = module.t2.to(orig_weight.device, dtype=orig_weight.dtype)
+            updown2 = pro3(t2, w2a, w2b)
+        else:
+            updown2 = _rebuild_conventional(w2a, w2b, output_shape_2)
+        updown = torch.kron(updown1, updown2)
+    
+    elif isinstance(module, FullModule):
         output_shape = module.weight.shape
         updown = module.weight.to(orig_weight.device, dtype=orig_weight.dtype)
-    
-    elif module.__class__.__name__ == 'IA3Module':
-        output_shape = [module.w.size(0), orig_weight.size(1)]
-        if module.on_input:
-            output_shape.reverse()
-        else:
-            module.w = module.w.reshape(-1, 1)
-        updown = orig_weight * module.w
-    
-    else:
-        raise NotImplementedError(
-            f"Unknown module type: {module.__class__.__name__}\n"
-            "If the type is one of "
-            "'LoraUpDownModule', 'LoraHadaModule', 'FullModule', 'IA3Module' "
-            "You may have other lora extension that conflict with locon extension."
-        )
     
     if hasattr(module, 'bias') and module.bias != None:
         updown = updown.reshape(module.bias.shape)
